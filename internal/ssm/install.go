@@ -3,6 +3,7 @@ package ssm
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	stdErrors "errors"
 	"fmt"
 	"io"
@@ -23,6 +24,7 @@ import (
 
 const (
 	defaultInstallerPath = "/opt/ssm/ssm-setup-cli"
+	defaultSSMCongigPath = "/etc/amazon/ssm/amazon-ssm-agent.json"
 	configRoot           = "/etc/amazon"
 	artifactName         = "ssm"
 
@@ -30,6 +32,8 @@ const (
 	gpgConfigDirName   = ".gnupg"
 	gpgConfigFileName  = "gpg.conf"
 	gpgConfigFilePerms = 0o755
+
+	credentialRetryMaxSleepSeconds = 60
 )
 
 // Source serves an SSM installer binary for the target platform.
@@ -73,6 +77,11 @@ func installFromSource(ctx context.Context, opts InstallOptions) error {
 
 	if err := runInstallWithRetries(ctx, installerPath, opts.Region); err != nil {
 		return errors.Wrapf(err, "failed to install ssm agent")
+	}
+
+	opts.Logger.Info("Configuring SSMAgent for hybrid node")
+	if err := ConfigureSSMAgent(opts.InstallRoot); err != nil {
+		return fmt.Errorf("failed to configure ssm agent: %w", err)
 	}
 	return nil
 }
@@ -235,4 +244,57 @@ func runInstallWithRetries(ctx context.Context, installerPath, region string) er
 		return exec.CommandContext(ctx, installerPath, "-install", "-region", region, "-version", "latest")
 	}
 	return cmd.Retry(ctx, installCmdBuilder, 5*time.Second)
+}
+
+func ConfigureSSMAgent(installRoot string) error {
+	configFile := filepath.Join(installRoot, defaultSSMCongigPath)
+
+	// Create directory if it doesn't exist
+	if err := os.MkdirAll(filepath.Dir(configFile), 0o755); err != nil {
+		return err
+	}
+
+	// Read existing config or create empty
+	var config map[string]interface{}
+	var fileMode os.FileMode = 0o600 // Default for new files (root can read/write only)
+
+	data, err := os.ReadFile(configFile)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("failed to read existing config file %s: %w", configFile, err)
+		}
+	} else {
+		// File exists, prevent its permissions
+		if fileInfo, statErr := os.Stat(configFile); statErr == nil {
+			fileMode = fileInfo.Mode()
+		}
+
+		if err := json.Unmarshal(data, &config); err != nil {
+			return fmt.Errorf("failed to parse existing config file %s: %w", configFile, err)
+		}
+	}
+
+	if config == nil {
+		config = make(map[string]interface{})
+	}
+
+	// Add or update SSM configuration
+	ssm, exists := config["Ssm"].(map[string]interface{})
+	if !exists {
+		ssm = make(map[string]interface{})
+		config["Ssm"] = ssm
+	}
+	ssm["CredentialRetryMaxSleepSeconds"] = credentialRetryMaxSleepSeconds
+
+	// Write config
+	updatedData, err := json.Marshal(config)
+	if err != nil {
+		return fmt.Errorf("failed to marshal config data: %w", err)
+	}
+
+	if err := os.WriteFile(configFile, updatedData, fileMode); err != nil {
+		return fmt.Errorf("failed to write config file %s: %w", configFile, err)
+	}
+
+	return nil
 }

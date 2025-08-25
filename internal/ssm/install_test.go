@@ -321,3 +321,242 @@ func TestUninstall(t *testing.T) {
 		})
 	}
 }
+
+func TestConfigureSSMAgent(t *testing.T) {
+	tests := []struct {
+		name         string
+		existingJSON string
+		expected     map[string]interface{}
+		wantErr      string
+	}{
+		{
+			name:         "file does not exist",
+			existingJSON: "",
+			expected: map[string]interface{}{
+				"Ssm": map[string]interface{}{
+					"CredentialRetryMaxSleepSeconds": 60,
+				},
+			},
+		},
+		{
+			name:         "existing config without SSM block",
+			existingJSON: `{"Identity": {"ConsumptionOrder": ["OnPrem"],"CustomIdentities": null}}`,
+			expected: map[string]interface{}{
+				"Identity": map[string]interface{}{
+					"ConsumptionOrder": []interface{}{"OnPrem"},
+					"CustomIdentities": nil,
+				},
+				"Ssm": map[string]interface{}{
+					"CredentialRetryMaxSleepSeconds": 60,
+				},
+			},
+		},
+		{
+			name:         "existing config with SSM block",
+			existingJSON: `{"Identity": {"ConsumptionOrder": ["OnPrem"]},"Ssm": {"OtherSetting": true}}`,
+			expected: map[string]interface{}{
+				"Identity": map[string]interface{}{
+					"ConsumptionOrder": []interface{}{"OnPrem"},
+				},
+				"Ssm": map[string]interface{}{
+					"OtherSetting":                   true,
+					"CredentialRetryMaxSleepSeconds": 60,
+				},
+			},
+		},
+		{
+			name:         "invalid JSON in existing config",
+			existingJSON: `{"Identity": {"ConsumptionOrder": ["OnPrem"],"CustomIdentities": null}`,
+			wantErr:      "failed to parse existing config file",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := NewGomegaWithT(t)
+			tmpDir := t.TempDir()
+			configDir := filepath.Join(tmpDir, "etc/amazon/ssm")
+			configFile := filepath.Join(configDir, "amazon-ssm-agent.json")
+
+			// Create config directory
+			err := os.MkdirAll(configDir, 0o755)
+			g.Expect(err).NotTo(HaveOccurred())
+
+			// Write existing config if provided
+			if tt.existingJSON != "" {
+				err = os.WriteFile(configFile, []byte(tt.existingJSON), 0o644)
+				g.Expect(err).NotTo(HaveOccurred())
+			}
+
+			// Call configureSSMAgent
+			err = ssm.ConfigureSSMAgent(tmpDir)
+
+			if tt.wantErr != "" {
+				g.Expect(err).To(HaveOccurred())
+				g.Expect(err.Error()).To(ContainSubstring(tt.wantErr))
+				return
+			}
+
+			g.Expect(err).NotTo(HaveOccurred())
+
+			// Read and verify result
+			data, err := os.ReadFile(configFile)
+			g.Expect(err).NotTo(HaveOccurred())
+
+			var result map[string]interface{}
+			err = json.Unmarshal(data, &result)
+			g.Expect(err).NotTo(HaveOccurred())
+
+			// Check SSM configuration specifically
+			ssmConfig, exists := result["Ssm"].(map[string]interface{})
+			g.Expect(exists).To(BeTrue(), "SSM configuration block not found")
+
+			value, ok := ssmConfig["CredentialRetryMaxSleepSeconds"]
+			g.Expect(ok).To(BeTrue(), "CredentialRetryMaxSleepSeconds not found in SSM config")
+			g.Expect(value).To(Equal(float64(60)), "Expected CredentialRetryMaxSleepSeconds to be 60")
+		})
+	}
+}
+
+func TestConfigureSSMAgentPermissions(t *testing.T) {
+	tests := []struct {
+		name              string
+		existingFilePerms *os.FileMode // nil means no existing file
+		expectedFilePerms os.FileMode
+		existingJSON      string
+	}{
+		{
+			name:              "new file gets 0o600 permissions",
+			existingFilePerms: nil,
+			expectedFilePerms: 0o600,
+		},
+		{
+			name:              "existing file with 0o644 permissions preserved",
+			existingFilePerms: func() *os.FileMode { m := os.FileMode(0o644); return &m }(),
+			expectedFilePerms: 0o644,
+			existingJSON:      `{"existing": true}`,
+		},
+		{
+			name:              "existing file with 0o600 permissions preserved",
+			existingFilePerms: func() *os.FileMode { m := os.FileMode(0o600); return &m }(),
+			expectedFilePerms: 0o600,
+			existingJSON:      `{"existing": true}`,
+		},
+		{
+			name:              "existing file with 0o640 permissions preserved",
+			existingFilePerms: func() *os.FileMode { m := os.FileMode(0o640); return &m }(),
+			expectedFilePerms: 0o640,
+			existingJSON:      `{"existing": true}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := NewGomegaWithT(t)
+			tmpDir := t.TempDir()
+			configDir := filepath.Join(tmpDir, "etc/amazon/ssm")
+			configFile := filepath.Join(configDir, "amazon-ssm-agent.json")
+
+			// Create config directory
+			err := os.MkdirAll(configDir, 0o755)
+			g.Expect(err).NotTo(HaveOccurred())
+
+			// Create existing file with specific permissions if specified
+			if tt.existingFilePerms != nil {
+				err = os.WriteFile(configFile, []byte(tt.existingJSON), *tt.existingFilePerms)
+				g.Expect(err).NotTo(HaveOccurred())
+			}
+
+			// Call configureSSMAgent
+			err = ssm.ConfigureSSMAgent(tmpDir)
+			g.Expect(err).NotTo(HaveOccurred())
+
+			// Check file permissions
+			fileInfo, err := os.Stat(configFile)
+			g.Expect(err).NotTo(HaveOccurred())
+
+			actualPerms := fileInfo.Mode().Perm()
+			g.Expect(actualPerms).To(Equal(tt.expectedFilePerms),
+				"Expected file permissions %o, got %o", tt.expectedFilePerms, actualPerms)
+
+			// Verify the configuration content is correct
+			data, err := os.ReadFile(configFile)
+			g.Expect(err).NotTo(HaveOccurred())
+
+			var result map[string]interface{}
+			err = json.Unmarshal(data, &result)
+			g.Expect(err).NotTo(HaveOccurred())
+
+			// Check SSM configuration
+			ssmConfig, exists := result["Ssm"].(map[string]interface{})
+			g.Expect(exists).To(BeTrue(), "SSM configuration block not found")
+
+			value, ok := ssmConfig["CredentialRetryMaxSleepSeconds"]
+			g.Expect(ok).To(BeTrue(), "CredentialRetryMaxSleepSeconds not found in SSM config")
+			g.Expect(value).To(Equal(float64(60)), "Expected CredentialRetryMaxSleepSeconds to be 60")
+		})
+	}
+}
+
+func TestConfigureSSMAgentErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		setup   func(tmpDir string) error
+		wantErr string
+	}{
+		{
+			name: "file read permission error",
+			setup: func(tmpDir string) error {
+				configDir := filepath.Join(tmpDir, "etc/amazon/ssm")
+				configFile := filepath.Join(configDir, "amazon-ssm-agent.json")
+
+				// Create config directory and file
+				if err := os.MkdirAll(configDir, 0o755); err != nil {
+					return err
+				}
+				if err := os.WriteFile(configFile, []byte(`{"test": true}`), 0o644); err != nil {
+					return err
+				}
+
+				// Remove read permissions
+				return os.Chmod(configFile, 0o000)
+			},
+			wantErr: "failed to read existing config file",
+		},
+		{
+			name: "file write permission error",
+			setup: func(tmpDir string) error {
+				configDir := filepath.Join(tmpDir, "etc/amazon/ssm")
+				configFile := filepath.Join(configDir, "amazon-ssm-agent.json")
+
+				// Create config directory and a valid config file first
+				if err := os.MkdirAll(configDir, 0o755); err != nil {
+					return err
+				}
+				if err := os.WriteFile(configFile, []byte(`{"existing": true}`), 0o644); err != nil {
+					return err
+				}
+
+				// Make the config file read-only to cause write failure
+				return os.Chmod(configFile, 0o444)
+			},
+			wantErr: "failed to write config file",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := NewGomegaWithT(t)
+			tmpDir := t.TempDir()
+
+			// Setup test conditions
+			err := tt.setup(tmpDir)
+			g.Expect(err).NotTo(HaveOccurred())
+
+			// Call configureSSMAgent and expect error
+			err = ssm.ConfigureSSMAgent(tmpDir)
+			g.Expect(err).To(HaveOccurred())
+			g.Expect(err.Error()).To(ContainSubstring(tt.wantErr))
+		})
+	}
+}
